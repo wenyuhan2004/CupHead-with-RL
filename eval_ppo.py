@@ -73,7 +73,8 @@ if __name__ == "__main__":
     try:
         while True:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, trunc, info = env.step(action)
+            obs, reward, done, info = env.step(action)
+            trunc = False
             total_reward += reward[0]
             step_count += 1
 
@@ -86,7 +87,7 @@ if __name__ == "__main__":
             # 如果回合结束
             if done[0]:
                 episode_rewards.append(total_reward)
-                print(f"[EPISODE END] Total reward={total_reward:.2f}, len={step_count}")
+                print(f"[EPISODE END] Total reward={total_reward:.2f}, len={step_count}")                                                                    
                 total_reward = 0
                 step_count = 0
                 obs = env.reset()

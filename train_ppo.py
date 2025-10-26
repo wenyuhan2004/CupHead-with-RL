@@ -28,33 +28,35 @@ def focus_cuphead_window():
     except Exception:
         print("[WARN] 无法激活窗口。");  return False
 
-# ------------------ 训练回调（保持不变） ------------------
+# ------------------ 训练回调 ------------------
 class CupheadTrainCallback(BaseCallback):
-    def __init__(self, print_freq: int = 5000, verbose: int = 1):
+    def __init__(self, print_freq: int = 2000, verbose: int = 1):
         super().__init__(verbose)
         self.print_freq = print_freq
         self.ep_rews, self.ep_lens = [], []
-        self.last_hp_snapshot = None
+        self.last_info = None
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
         for info in infos:
             ep = info.get("episode")
             if ep is not None:
                 self.ep_rews.append(ep["r"]); self.ep_lens.append(ep["l"])
-            if "boss_hp" in info and "player_hp" in info:
-                self.last_hp_snapshot = (info["boss_hp"], info["player_hp"])
+            self.last_info = info
         if self.n_calls % self.print_freq == 0:
             print(f"\n=== Global Step: {self.num_timesteps} ===")
             if self.ep_rews:
                 print(f"Recent Avg Reward(10): {np.mean(self.ep_rews[-10:]):.3f}")
                 print(f"Recent Avg EpLen(10):  {np.mean(self.ep_lens[-10:]):.1f}")
-                print(f"Last 3 Rewards: {self.ep_rews[-3:]}")
-            else:
-                print("No finished episode yet…")
-            if self.last_hp_snapshot:
-                bhp, php = self.last_hp_snapshot
+            if self.last_info:
+                bhp = self.last_info.get("boss_hp", None)
+                php = self.last_info.get("player_hp", None)
+                parry = self.last_info.get("parry", None)
+                xval = self.last_info.get("x", None)
                 print(f"HP snapshot -> Boss:{'None' if bhp is None else f'{bhp:.1f}'}, "
                       f"Player:{'None' if php is None else str(php)}")
+                print(f"Parry:{parry}   X:{'None' if xval is None else f'{xval:.1f}'}   "
+                      f"Phase2:{self.last_info.get('phase2', False)}   "
+                      f"StillSteps:{self.last_info.get('x_still_steps', 0)}")
             print("========================================")
         return True
 
@@ -67,17 +69,22 @@ def make_env(rank: int):
             stack=4,
             auto_restart=True,
             debug=False,
-            hp_every_n=3,   # 每3步读一次HP，提速
+            # ↓↓↓ 降采样读取（与 read_hp.py 的限频配合，保证吞吐）
+            hp_every_n=3,
+            parry_every_n=3,
+            x_every_n=2,
+            # ↓↓↓ 奖励塑形参数（可按需要微调）
+            x_still_thresh=50.0,
+            reward_parry_gain=0.20,
+            reward_duck_dash=0.02,
+            reward_phase_bonus=0.50,
+            still_penalty_unit=0.01,
         )
     return _init
 
 # ------------------ 自动续训工具 ------------------
 def find_latest_checkpoint(folder="models", prefix="cuphead_ppo_"):
-    """
-    返回最新的 checkpoint 路径，如 models/cuphead_ppo_40000_steps.zip
-    若没有则返回 None
-    """
-    if not os.path.isdir(folder): 
+    if not os.path.isdir(folder):
         return None
     pat = re.compile(rf"^{re.escape(prefix)}(\d+)_steps\.zip$")
     best = None; best_steps = -1
@@ -94,16 +101,20 @@ if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
     focus_cuphead_window()
 
+    # 单环境
     vec = DummyVecEnv([make_env(0)])
     vec = VecMonitor(vec)
 
-    # 1) 优先找最新 checkpoint；找不到就新建模型
-    ckpt_path = "./models/cuphead_ppo_40000_steps.zip"
-    if ckpt_path and os.path.isfile(ckpt_path):
+    # —— 从头训练 —— #
+    # 若以后需要续训，把 next line 改为：ckpt_path = find_latest_checkpoint()
+    ckpt_path = None
+
+    if ckpt_path:
         print(f"[INFO] 载入最新检查点继续训练: {ckpt_path}")
-        model = PPO.load(ckpt_path, env=vec, tensorboard_log="./logs_ppo/")
+        model = PPO.load(ckpt_path, env=vec, tensorboard_log="./logs_ppo/", device="auto")
     else:
-        print("[INFO] 未找到检查点，从头开始训练。")
+        print("[INFO] 未加载检查点，从头开始训练。")
+        # 可选：自定义网络结构；默认 CnnPolicy 已支持 MultiBinary 动作
         model = PPO(
             "CnnPolicy",
             vec,
@@ -112,17 +123,18 @@ if __name__ == "__main__":
             batch_size=256,
             learning_rate=3e-4,
             gamma=0.99,
-            ent_coef=0.01,   # MultiBinary 更强一点探索
+            ent_coef=0.01,      # MultiBinary 稍强探索
             clip_range=0.2,
             n_epochs=10,
-            tensorboard_log="./logs_ppo/"
+            tensorboard_log="./logs_ppo/",
+            device="auto",
         )
 
-    # 2) 定时保存 + 控制台打印
+    # 定时保存 + 控制台打印
     ckpt_cb  = CheckpointCallback(save_freq=10_000, save_path="./models/", name_prefix="cuphead_ppo")
-    train_cb = CupheadTrainCallback(print_freq=1000)  # 可改为 1000 观察更频繁
+    train_cb = CupheadTrainCallback(print_freq=1000)
 
-    # 3) 开训
+    # 开训
     model.learn(total_timesteps=1_000_000, callback=[ckpt_cb, train_cb])
     model.save("./models/cuphead_ppo_final")
     vec.close()

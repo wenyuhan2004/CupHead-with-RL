@@ -1,22 +1,32 @@
 # read_hp.py
-import json, time, re, os,collections
+import json, time, re, os, collections, warnings
 import cv2, numpy as np, dxcam, pytesseract
-import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 CONF = "cuphead_roi.json"
-# 如未加入 PATH，请手动指定 Tesseract 路径
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# ====== Parry/X 的 OCR 频率与缓存（全局） ======
+PAR_OCR_EVERY = 2
+X_OCR_EVERY   = 2
+
+_parry_prev_sig = None
+_parry_prev_val = 0
+_parry_frame_idx = 0
+
+
+_x_prev_sig = None
+_x_prev_val = None
+_x_frame_idx = 0
+# -------------------- 通用抓帧 --------------------
 def grab(cam):
     frame = cam.get_latest_frame()
     while frame is None:
         frame = cam.get_latest_frame()
         time.sleep(0.005)
-    # dxcam 可能返回 BGRA
     return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR) if frame.shape[2] == 4 else frame
 
+# -------------------- Boss HP OCR --------------------
 def ocr_number_block(img_bgr):
-    """Boss 区域：读 '123.45/1234' 形式文本"""
     g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     g = cv2.GaussianBlur(g, (3, 3), 0)
     _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -24,26 +34,21 @@ def ocr_number_block(img_bgr):
     return pytesseract.image_to_string(th, config=cfg).strip()
 
 def parse_boss_hp(text):
-    """解析 Boss HP；容忍前导噪点，如 '.21.56/1235'"""
     text = text.strip()
-    text = re.sub(r"^[^\d]+", "", text)  # 去非数字前缀
+    text = re.sub(r"^[^\d]+", "", text)
     m = re.search(r"(\d+(?:\.\d+)?)[^\d]+(\d+)", text)
     if not m:
         return None, None
     cur = float(m.group(1)); mx = float(m.group(2))
-    if mx <= 0: 
+    if mx <= 0:
         return None, None
     cur = min(cur, mx)
     return cur, mx
 
-# -------------------- 玩家HP：OCR优先 --------------------
+# -------------------- 玩家 HP 识别（仅 0-4 单位数） --------------------
 def read_player_digit_only(img_bgr):
-    """
-    仅识别玩家 HP 数字（忽略 'HP.'），颜色无关，对红/黄/白底闪烁鲁棒。
-    返回 (pcur:int|None, raw_text:str)
-    """
     h, w = img_bgr.shape[:2]
-    right_ratio = 0.50  # 右侧数字区占比（必要时调 0.45~0.55）
+    right_ratio = 0.50
     rw = max(12, int(w * right_ratio))
     digit_roi = img_bgr[:, w - rw : w]
 
@@ -54,12 +59,14 @@ def read_player_digit_only(img_bgr):
 
     def try_ocr(bin_img):
         bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_DILATE, np.ones((2, 2), np.uint8), 1)
-        cfg = r'--psm 7 --oem 1 -c tessedit_char_whitelist=0123456789'
+        cfg = r'--psm 7 --oem 1 -c tessedit_char_whitelist=01234'
         raw = pytesseract.image_to_string(bin_img, config=cfg).strip()
-        m = re.search(r'(\d+)', raw)
-        return (int(m.group(1)), raw) if m else (None, raw)
+        m = re.findall(r'[0-4]', raw)
+        if m:
+            val = int(m[-1])
+            return val, raw
+        return None, raw
 
-    # 尝试顺序：OTSU-INV → ADAPT-INV → OTSU → ADAPT
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     p, raw = try_ocr(th)
     if p is not None: return p, raw
@@ -81,7 +88,6 @@ def read_player_digit_only(img_bgr):
     return None, "ocr_fail"
 
 def extract_digit_bin(ply_roi_bgr, right_ratio=0.50):
-    """裁剪出数字区并得到稳定的二值图，用于形状/模板兜底"""
     h, w = ply_roi_bgr.shape[:2]
     rw = max(12, int(w * right_ratio))
     roi = ply_roi_bgr[:, w - rw : w]
@@ -94,7 +100,6 @@ def extract_digit_bin(ply_roi_bgr, right_ratio=0.50):
     return th
 
 def is_digit_one_by_shape(bin_img):
-    """启发式判 '1'：高瘦、前景稀疏、面积适中"""
     img = cv2.resize(bin_img, (56, 96), interpolation=cv2.INTER_AREA)
     img = cv2.medianBlur(img, 3)
     cnts, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -103,16 +108,14 @@ def is_digit_one_by_shape(bin_img):
     c = max(cnts, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(c)
     area = cv2.contourArea(c)
-    aspect = h / (w + 1e-6)              # 期望 >= 2.4
-    area_ratio = area / (img.shape[0] * img.shape[1])  # 0.03~0.35
-    fg_ratio = (img > 0).mean()          # 稀疏笔画（避免把 4/5/8 误判为 1）
+    aspect = h / (w + 1e-6)
+    area_ratio = area / (img.shape[0] * img.shape[1])
+    fg_ratio = (img > 0).mean()
     return (aspect >= 2.4) and (0.03 <= area_ratio <= 0.35) and (fg_ratio <= 0.28)
 
-# -------------------- 模板库与滤波 --------------------
 class DigitTemplateBank:
-    """玩家数字模板库（0-9），用于 OCR 失败时兜底。"""
     def __init__(self):
-        self.templates = {}   # {digit -> [bin_img,...]}
+        self.templates = {}
         self.size = (28, 48)
 
     def add(self, bin_img, value):
@@ -137,7 +140,6 @@ class DigitTemplateBank:
         return best_d if best_s >= thresh else None
 
 class PlayerHPFilter:
-    """多数表决 + 粘滞保持（抗闪烁/掉帧）"""
     def __init__(self, hold_ms=500, require_k=3, window_size=5):
         self.hold_ms = hold_ms
         self.require_k = require_k
@@ -163,12 +165,11 @@ class PlayerHPFilter:
 digit_bank = DigitTemplateBank()
 hp_filter  = PlayerHPFilter(hold_ms=500, require_k=3, window_size=5)
 
-# -------------------- DEAD 快速判定（模板自举+匹配） --------------------
+# -------------------- DEAD 判定 --------------------
 DEAD_TEMPLATE = None
 DEAD_TSIZE = (180, 60)
 
 def make_dead_template(badge_bgr):
-    """从牌匾 ROI 自举 DEAD 模板"""
     roi = cv2.resize(badge_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
     g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
@@ -178,7 +179,6 @@ def make_dead_template(badge_bgr):
     return cv2.resize(th, DEAD_TSIZE, interpolation=cv2.INTER_AREA)
 
 def is_dead_fast(badge_bgr, thresh=0.72):
-    """若已有模板，则用模板匹配快速判定 DEAD；无模板返回 None"""
     global DEAD_TEMPLATE
     if DEAD_TEMPLATE is None:
         return None
@@ -193,7 +193,6 @@ def is_dead_fast(badge_bgr, thresh=0.72):
     return s >= thresh
 
 def detect_dead_text(img_bgr):
-    """OCR 慢路径检测 DEAD（大小写不敏感）"""
     h, w = img_bgr.shape[:2]
     roi = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -215,27 +214,125 @@ def detect_dead_text(img_bgr):
     if re.search(r'D[E3][A4]D', joined):
         return True, joined
     return False, joined
+
 def is_hp_badge_red(ply_roi_bgr, frac_thresh=0.22):
-    """
-    检测玩家HP牌匾是否为“红底”状态（1血闪烁）。
-    返回 True/False。
-    frac_thresh: 红色像素占比阈值（可在 0.18~0.30 间微调）
-    """
     hsv = cv2.cvtColor(ply_roi_bgr, cv2.COLOR_BGR2HSV)
-    # 红色两段（高饱和高明度，避免误检粉/褐）
     mask1 = cv2.inRange(hsv, (0,   120, 120), (10,  255, 255))
     mask2 = cv2.inRange(hsv, (170, 120, 120), (180, 255, 255))
     mask = cv2.bitwise_or(mask1, mask2)
-    # 形态学清噪
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), 1)
     red_ratio = (mask > 0).mean()
     return red_ratio >= frac_thresh
+
+# -------------------- Parry（仅数字 ROI） --------------------
+def read_parry_count_only(img_bgr):
+    global _parry_prev_sig, _parry_prev_val, _parry_frame_idx
+    if img_bgr is None or img_bgr.size == 0:
+        return None, "parry:empty"
+
+    _parry_frame_idx += 1
+    roi = cv2.resize(img_bgr, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.bitwise_not(th)
+    sig = int(th.sum())
+
+    if _parry_prev_sig is not None and sig == _parry_prev_sig:
+        return _parry_prev_val, "parry:cache-hit"
+
+    if (_parry_frame_idx % PAR_OCR_EVERY) != 0:
+        _parry_prev_sig = sig
+        return _parry_prev_val, "parry:rate-limit"
+
+    th = cv2.morphologyEx(th, cv2.MORPH_DILATE, np.ones((2,2), np.uint8), 1)
+    cfg = r'--psm 7 --oem 1 -c tessedit_char_whitelist=0123456789'
+    raw = pytesseract.image_to_string(th, config=cfg).strip()
+    nums = re.findall(r'(\d+)', raw)
+    if not nums:
+        _parry_prev_sig = sig
+        return _parry_prev_val, "parry:none"
+    val = int(nums[-1])
+    if val + 5 < _parry_prev_val:
+        _parry_prev_sig = sig
+        return _parry_prev_val, f"parry:drop-ignored({val}->{_parry_prev_val})"
+    val = max(0, min(val, 9999))
+    _parry_prev_val = val
+    _parry_prev_sig = sig
+    return val, f"parry:'{raw}'"
+
+# -------------------- X 坐标（仅数字 ROI，支持负号） --------------------
+def read_xcoord_only(img_bgr):
+    """
+    读取 X 坐标（浮点/负号）。
+    规则：
+      - 若首个非空字符为 '-' → 取第一个带负号的数字（如 '-370-1' 取 -370）
+      - 否则把 '-' 当分隔符 → 取减号之前的数字（如 '655-18' 取 655）
+      - 若都不匹配 → 取全串中最长的数字段
+    """
+    global _x_prev_sig, _x_prev_val, _x_frame_idx
+    if img_bgr is None or img_bgr.size == 0:
+        return (_x_prev_val if _x_prev_val is not None else None), "x:empty"
+
+    _x_frame_idx += 1
+
+    roi = cv2.resize(img_bgr, None, fx=1.6, fy=1.6, interpolation=cv2.INTER_LINEAR)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.bitwise_not(th)
+
+    sig = int(th.sum())
+    if _x_prev_sig is not None and sig == _x_prev_sig:
+        return (_x_prev_val if _x_prev_val is not None else None), "x:cache-hit"
+
+    if (_x_frame_idx % X_OCR_EVERY) != 0:
+        _x_prev_sig = sig
+        return (_x_prev_val if _x_prev_val is not None else None), "x:rate-limit"
+
+    th = cv2.morphologyEx(th, cv2.MORPH_DILATE, np.ones((2,2), np.uint8), 1)
+    cfg = r'--psm 7 --oem 1 -c tessedit_char_whitelist=-0123456789.'
+    raw = pytesseract.image_to_string(th, config=cfg).strip()
+
+    # 全部数字片段（含负号/小数）
+    matches = re.findall(r'-?\d+(?:[.,]\d+)?', raw)
+    if not matches:
+        _x_prev_sig = sig
+        return (_x_prev_val if _x_prev_val is not None else None), "x:none"
+
+    s = raw.lstrip()  # 忽略前导空白
+    if s.startswith('-'):
+        # 情况A：首个非空字符为 '-' → 取第一个带负号的数字
+        m = re.search(r'^-\d+(?:[.,]\d+)?', s)
+        txt = m.group(0) if m else max(matches, key=len)
+    else:
+        # 情况B：内部 '-' 作为分隔符 → 取减号前面的数字
+        parts = re.split(r'-', raw, maxsplit=1)
+        pre_nums = re.findall(r'\d+(?:[.,]\d+)?', parts[0]) if parts else []
+        txt = max(pre_nums, key=len) if pre_nums else max(matches, key=len)
+
+    txt = txt.replace(',', '.')
+    try:
+        val = float(txt)
+    except Exception:
+        _x_prev_sig = sig
+        return (_x_prev_val if _x_prev_val is not None else None), f"x:parse-fail('{raw}')"
+
+    _x_prev_val = val
+    _x_prev_sig = sig
+    return val, f"x:'{raw}'"
+
+
 # -------------------- 主流程 --------------------
 def main():
     if not os.path.exists(CONF):
         raise FileNotFoundError(f"未找到 {CONF}，请先运行 calibrate_roi.py")
     roi = json.load(open(CONF, "r", encoding="utf-8"))
-    assert "boss_hp_roi" in roi and "player_hp_roi" in roi, "ROI 配置缺少必要字段"
+    if "boss_hp_roi" not in roi or "player_hp_roi" not in roi:
+        raise KeyError("ROI 配置缺少 boss_hp_roi 或 player_hp_roi")
+
+    if "parry_roi" not in roi:
+        warnings.warn("ROI 配置缺少 parry_roi（格挡次数数字）。")
+    if "xcoord_roi" not in roi:
+        warnings.warn("ROI 配置缺少 xcoord_roi（X 坐标数字）。")
 
     cam = dxcam.create(output_color="BGR")
     cam.start(target_fps=60, video_mode=True)
@@ -243,7 +340,6 @@ def main():
 
     HOLD_MS = 400
     last_boss = {"cur": None, "max": None, "ts": 0.0}
-    last_pcur, last_p_ts = None, 0.0
     dead_confirm_cnt = 0
 
     try:
@@ -269,21 +365,17 @@ def main():
                 last_boss.update(cur=cur, max=mx, ts=now_ms)
 
             # ----- Player HP -----
-            # ----- Player HP（先判红底=1；否则再 OCR/形状/模板；DEAD 最后确认） -----
             px, py, pw, ph = roi["player_hp_roi"]
             ply_roi = frame[py:py+ph, px:px+pw]
 
-            # 0) DEAD 快速判定优先（你原逻辑不变）
             dead_fast = is_dead_fast(ply_roi, thresh=0.72)
             if dead_fast is True:
                 pcur, raw_p = 0, "DEAD_fast"
                 dead_confirm_cnt = 2
             else:
-                # 1) 先看是否红底（只有1血才会红白闪烁）
                 if is_hp_badge_red(ply_roi, frac_thresh=0.22):
                     pcur, raw_p = 1, "red_bg"
                 else:
-                    # 2) 非红底 → 正常流程：OCR → 形状启发式(判1) → 模板兜底
                     try:
                         pcur, raw_p = read_player_digit_only(ply_roi)
                     except Exception:
@@ -297,7 +389,6 @@ def main():
                         if p_tmpl is not None:
                             pcur, raw_p = p_tmpl, "tmpl_match"
 
-                # 3) DEAD 慢路径（首次OCR确认 + 自举模板），避免红底误判覆盖
                 if pcur is None or pcur == 0:
                     is_dead_slow, raw_dead = detect_dead_text(ply_roi)
                     if is_dead_slow:
@@ -311,36 +402,63 @@ def main():
                 else:
                     dead_confirm_cnt = 0
 
-            # 4) 模板库扩充（有稳定数字时）
+            # 模板库扩充
             if isinstance(pcur, int) and pcur >= 0:
-                # 注意：此处也可用非红底时的 digit_bin 以免把红底形态存模板
                 try:
                     digit_bin = extract_digit_bin(ply_roi, right_ratio=0.50)
                     digit_bank.add(digit_bin, pcur)
                 except Exception:
                     pass
 
-            # 5) 稳态输出
             pshow = hp_filter.update(pcur)
 
+            # ----- Parry（若 ROI 存在） -----
+            parry_info = "parry_na"
+            if "parry_roi" in roi:
+                sx, sy, sw, sh = roi["parry_roi"]
+                parry_roi = frame[sy:sy+sh, sx:sx+sw]
+                pval_raw, ptag = read_parry_count_only(parry_roi)
+                parry_info = f"{pval_raw} (raw={pval_raw}, {ptag})"
+
+            # ----- X 坐标（若 ROI 存在） -----
+            x_info = "x_na"
+            if "xcoord_roi" in roi:
+                xx, xy, xw, xh = roi["xcoord_roi"]
+                x_roi = frame[xy:xy+xh, xx:xx+xw]
+                xval_raw, xtag = read_xcoord_only(x_roi)
+                x_info = f"{xval_raw} (raw={xval_raw}, {xtag})"
+
             # ----- 输出 -----
-            print(f"[BossHP] {cur}/{mx} (raw='{raw_boss}')    [PlayerHP] {pcur} (raw='{raw_p}')    dead_cnt={dead_confirm_cnt}")
+            print(
+                f"[BossHP] {cur}/{mx} (raw='{raw_boss}')    "
+                f"[PlayerHP] {pcur} (raw='{raw_p}')    "
+                f"[Parry] {parry_info}    "
+                f"[X] {x_info}    "
+                f"dead_cnt={dead_confirm_cnt}"
+            )
 
-            # ----- 可视化 -----
-            vis = frame.copy()
-            cv2.rectangle(vis, (bx, by), (bx+bw, by+bh), (0, 0, 255), 2)
-            cv2.rectangle(vis, (px, py), (px+pw, py+ph), (0, 255, 0), 2)
-            cv2.imshow("debug", cv2.resize(vis, (960, 540)))
-
-            k = cv2.waitKey(1) & 0xFF
-            if k in (ord('q'), 27):   # q / ESC
-                break
-            if k == ord('r'):
-                try:
-                    roi = json.load(open(CONF, "r", encoding="utf-8"))
-                    print("[INFO] 已重载 ROI 配置")
-                except Exception as e:
-                    print(f"[WARN] 重载 ROI 失败: {e}")
+            # 可视化（按需）
+            SHOW_DEBUG = False
+            if SHOW_DEBUG:
+                vis = frame.copy()
+                cv2.rectangle(vis, (bx, by), (bx+bw, by+bh), (0, 0, 255), 2)
+                cv2.rectangle(vis, (px, py), (px+pw, py+ph), (0, 255, 0), 2)
+                if "parry_roi" in roi:
+                    sx, sy, sw, sh = roi["parry_roi"]
+                    cv2.rectangle(vis, (sx, sy), (sx+sw, sy+sh), (255, 0, 0), 2)
+                if "xcoord_roi" in roi:
+                    xx, xy, xw, xh = roi["xcoord_roi"]
+                    cv2.rectangle(vis, (xx, xy), (xx+xw, xy+xh), (0, 255, 255), 2)
+                cv2.imshow("debug", cv2.resize(vis, (960, 540)))
+                k = cv2.waitKey(1) & 0xFF
+                if k in (ord('q'), 27):
+                    break
+                if k == ord('r'):
+                    try:
+                        roi = json.load(open(CONF, "r", encoding="utf-8"))
+                        print("[INFO] 已重载 ROI 配置")
+                    except Exception as e:
+                        print(f"[WARN] 重载 ROI 失败: {e}")
 
     finally:
         cam.stop()

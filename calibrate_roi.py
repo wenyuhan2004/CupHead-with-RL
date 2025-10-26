@@ -1,5 +1,6 @@
 # calibrate_roi.py
 import json, cv2, numpy as np, dxcam, time, os
+
 CONF = "cuphead_roi.json"
 
 def grab_frame(cam):
@@ -19,12 +20,29 @@ def main():
     cam.start(target_fps=60, video_mode=True)
     time.sleep(0.2)
     img = grab_frame(cam)
+
     print("请框选【Boss HP 数字】区域")
     boss = select_roi("BossHP", img)
+
     print("请框选【玩家HP（数字或心形）】区域")
     player = select_roi("PlayerHP", img)
+
+    print("可选：请框选【Parry 数字】区域（仅数字，无标签）")
+    parry = select_roi("ParryCount", img)
+
+    print("可选：请框选【X 坐标数字】区域（仅数字，可能带负号）")
+    xcoord = select_roi("XCoord", img)
+
+    data = {
+        "boss_hp_roi": boss,
+        "player_hp_roi": player,
+        "parry_roi": parry,
+        "xcoord_roi": xcoord,
+        # 兼容位：你可按需修改
+        "skill_mode": "auto"
+    }
     with open(CONF, "w", encoding="utf-8") as f:
-        json.dump({"boss_hp_roi": boss, "player_hp_roi": player}, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"ROI 已保存到 {os.path.abspath(CONF)}")
     cam.stop()
 
