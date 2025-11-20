@@ -5,18 +5,19 @@ import cv2, numpy as np, dxcam, pytesseract
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 CONF = "cuphead_roi.json"
 
-# ====== Parry/X 的 OCR 频率与缓存（全局） ======
-PAR_OCR_EVERY = 2
-X_OCR_EVERY   = 2
+# ====== 统一频率：每 3 帧一次 ======
+PAR_OCR_EVERY    = 3   # Parry OCR 限频
+X_OCR_EVERY      = 3   # X 坐标 OCR 限频
+FRAME_EMIT_EVERY = 3   # 主循环每 3 帧才执行识别与打印
 
 _parry_prev_sig = None
 _parry_prev_val = 0
 _parry_frame_idx = 0
 
-
 _x_prev_sig = None
 _x_prev_val = None
 _x_frame_idx = 0
+
 # -------------------- 通用抓帧 --------------------
 def grab(cam):
     frame = cam.get_latest_frame()
@@ -63,10 +64,11 @@ def read_player_digit_only(img_bgr):
         raw = pytesseract.image_to_string(bin_img, config=cfg).strip()
         m = re.findall(r'[0-4]', raw)
         if m:
-            val = int(m[-1])
+            val = int(m[-1])   # 只取最后一位
             return val, raw
         return None, raw
 
+    # 尝试顺序：OTSU-INV → ADAPT-INV → OTSU → ADAPT
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     p, raw = try_ocr(th)
     if p is not None: return p, raw
@@ -292,19 +294,16 @@ def read_xcoord_only(img_bgr):
     cfg = r'--psm 7 --oem 1 -c tessedit_char_whitelist=-0123456789.'
     raw = pytesseract.image_to_string(th, config=cfg).strip()
 
-    # 全部数字片段（含负号/小数）
     matches = re.findall(r'-?\d+(?:[.,]\d+)?', raw)
     if not matches:
         _x_prev_sig = sig
         return (_x_prev_val if _x_prev_val is not None else None), "x:none"
 
-    s = raw.lstrip()  # 忽略前导空白
+    s = raw.lstrip()
     if s.startswith('-'):
-        # 情况A：首个非空字符为 '-' → 取第一个带负号的数字
         m = re.search(r'^-\d+(?:[.,]\d+)?', s)
         txt = m.group(0) if m else max(matches, key=len)
     else:
-        # 情况B：内部 '-' 作为分隔符 → 取减号前面的数字
         parts = re.split(r'-', raw, maxsplit=1)
         pre_nums = re.findall(r'\d+(?:[.,]\d+)?', parts[0]) if parts else []
         txt = max(pre_nums, key=len) if pre_nums else max(matches, key=len)
@@ -319,7 +318,6 @@ def read_xcoord_only(img_bgr):
     _x_prev_val = val
     _x_prev_sig = sig
     return val, f"x:'{raw}'"
-
 
 # -------------------- 主流程 --------------------
 def main():
@@ -341,10 +339,17 @@ def main():
     HOLD_MS = 400
     last_boss = {"cur": None, "max": None, "ts": 0.0}
     dead_confirm_cnt = 0
+    frame_idx = 0  # ★ 统一节流计数
 
     try:
         while True:
             frame = grab(cam)
+            frame_idx += 1
+
+            # 仅每3帧执行识别与打印
+            if (frame_idx % FRAME_EMIT_EVERY) != 0:
+                continue
+
             now_ms = time.time() * 1000
 
             # ----- Boss HP -----
