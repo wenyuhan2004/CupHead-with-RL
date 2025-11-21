@@ -81,7 +81,7 @@ def make_env(rank: int):
     def _init():
         env = CupheadEnv(
             decision_fps=12,
-            frame_size=(400, 225),
+            frame_size=(192, 108),
             stack=4,
             auto_restart=True,
             debug=False,

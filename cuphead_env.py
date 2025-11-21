@@ -53,7 +53,8 @@ def focus_cuphead_window():
         if wins:
             w = gw.getWindowsWithTitle(wins[0])[0]
             w.activate(); w.restore()
-            time.sleep(0.2)
+            # 提高内存读取频率（约30FPS），便于每步都拿到最新缓存
+            time.sleep(1.0 / 30.0)
             return True
     except Exception:
         pass
@@ -109,6 +110,7 @@ class CupheadEnv(gym.Env):
         x_max: float = 228.0,
         x_margin: float = 5.0,
         reward_wall_penalty: float = 1.0,
+        dir_hold_limit: int = 20,
     ):
         super().__init__()
         self.debug = debug
@@ -144,6 +146,7 @@ class CupheadEnv(gym.Env):
         self.x_max = float(x_max)
         self.x_margin = float(max(0.0, x_margin))
         self.reward_wall_penalty = float(reward_wall_penalty)
+        self.dir_hold_limit = int(max(1, dir_hold_limit))
 
         # —— 动作 / 观测空间 —— #
         # 扩展为10维：原9维 + 跳跃强度
@@ -416,20 +419,22 @@ class CupheadEnv(gym.Env):
         if len(mask) < 10:
             mask = list(mask) + [0] * (10 - len(mask))
         L, R, Up, Down, Jump, Shoot, Dash, Lock, Special, JumpHold = [int(x) for x in mask]
-        # 攻击键默认常开
-        Shoot = 1
+        # 攻击键改为两步一按（1/0交替）
+        if not hasattr(self, "_shoot_phase"):
+            self._shoot_phase = False
+        if self._shoot_phase:
+            Shoot = 1
+        else:
+            Shoot = 0
+        self._shoot_phase = not self._shoot_phase
 
         if not hasattr(self, "_prev_action"):
             self._prev_action = [0] * 10
 
         # --- 方向互斥 (L/R, Up/Down) ---
         if L and R:
-            if self._prev_action[0] == 1 and self._prev_action[1] == 0:
-                L = 0
-            elif self._prev_action[1] == 1 and self._prev_action[0] == 0:
-                R = 0
-            else:
-                L = R = 0
+            # 同时按左右，置为空方向避免卡死
+            L = R = 0
         if Up and Down:
             if self._prev_action[2] == 1 and self._prev_action[3] == 0:
                 Up = 0
@@ -457,6 +462,20 @@ class CupheadEnv(gym.Env):
             self.facing_dir = -1
         elif R and not L:
             self.facing_dir = 1
+
+        # --- 方向卡死防抖：同向持续过长则强制松开 ---
+        dir_cmd = -1 if L and not R else (1 if R and not L else 0)
+        if dir_cmd == self._dir_hold_dir and dir_cmd != 0:
+            self._dir_hold_steps += 1
+        else:
+            self._dir_hold_dir = dir_cmd
+            self._dir_hold_steps = 0
+        if self._dir_hold_steps >= self.dir_hold_limit:
+            self._release(self.key_left)
+            self._release(self.key_right)
+            L = R = 0
+            self._dir_hold_steps = 0
+            self._dir_hold_dir = 0
 
         # --- Duck Dash 触发（S自动触发Shift）---
         down_trigger = bool(Down)
@@ -626,6 +645,8 @@ class CupheadEnv(gym.Env):
         self.last_player_hp = self.player_hp_max
         self._last_player_hp_raw = None
         self._pending_safe = []
+        self._dir_hold_steps = 0
+        self._dir_hold_dir = 0
         return self.stackbuf.copy(), {}
 
     def step(self, action):
@@ -671,6 +692,13 @@ class CupheadEnv(gym.Env):
 
         parry_cur = 0
 
+        # 当前动作左右键状态（用本步动作，避免方向判断反转）
+        act_mask = list(action) if isinstance(action, (list, tuple)) else np.array(action).tolist()
+        if len(act_mask) < 7:
+            act_mask = act_mask + [0] * (7 - len(act_mask))
+        cur_left, cur_right = bool(int(act_mask[0])), bool(int(act_mask[1]))
+        cur_dash = bool(int(act_mask[6]))
+
         if read_x_now:
             x_cur = self._fetch_xcoord(frame)
         else:
@@ -679,9 +707,11 @@ class CupheadEnv(gym.Env):
         reward = 0.0
         # 边界推进惩罚：在边缘仍向外走
         if x_cur is not None:
-            if (x_cur <= self.x_min + self.x_margin) and bool(self._prev_action[0]):
+            at_left_edge = (x_cur <= self.x_min + self.x_margin)
+            at_right_edge = (x_cur >= self.x_max - self.x_margin)
+            if at_left_edge and (cur_left or (cur_dash and self.facing_dir < 0)):
                 reward -= self.reward_wall_penalty
-            if (x_cur >= self.x_max - self.x_margin) and bool(self._prev_action[1]):
+            if at_right_edge and (cur_right or (cur_dash and self.facing_dir > 0)):
                 reward -= self.reward_wall_penalty
 
         # ==== 奖励 shaping ====
