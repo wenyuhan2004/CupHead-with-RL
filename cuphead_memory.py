@@ -35,10 +35,17 @@ def _load_config() -> Dict[str, Any]:
         },
         "player": {
             "module": "mono.dll",
-            "base_offset": 0x0027BAA0,
-            "offsets": [0xC8, 0x60],
+            "base_offset": 0x002BD940,
+            "offsets": [0x688, 0xE8, 0x120],
             "final_offset": 0xB4,
             "type": "int",
+        },
+        "player_x": {
+            "module": "UnityPlayer.dll",
+            "base_offset": 0x01468F30,
+            "offsets": [0x38],
+            "final_offset": 0x18C,
+            "type": "float",
         },
     }
     cfg_path = "cuphead_mem.json"
@@ -140,3 +147,6 @@ class CupheadMemoryReader:
 
     def read_player_hp(self) -> Optional[float]:
         return self._read_value("player")
+
+    def read_player_x(self) -> Optional[float]:
+        return self._read_value("player_x")
