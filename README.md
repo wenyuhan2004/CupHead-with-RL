@@ -281,11 +281,6 @@ A:
 - 确认游戏窗口标题为 "Cuphead"
 - 检查游戏版本（仅支持 Steam/GOG 标准版）
 
-### Q: 智能体一直原地不动
-A:
-- 初期正常（高探索率），等待 ε 衰减
-- 检查奖励是否正常：观察 TensorBoard 曲线
-- 尝试调低 gamma（更注重即时奖励）
 
 ### Q: 训练中断后如何恢复
 A: 直接再次运行 `python train.py`，会自动加载 `checkpoints_dqn/latest.pt`
@@ -313,17 +308,5 @@ A:
 - [ ] 层次强化学习拆解复杂动作
 - [ ] 模仿学习预训练加速收敛
 
-## 许可证
 
-MIT License - 仅供学习研究使用
 
-## 致谢
-
-- [Cuphead](https://www.cupheadgame.com/) by Studio MDHR
-- [PyTorch](https://pytorch.org/)
-- [Gymnasium](https://gymnasium.farama.org/)
-- [dxcam](https://github.com/ra1nty/DXcam)
-
----
-
-**免责声明**：本项目仅用于学术研究和技术学习，不鼓励任何作弊行为。请在单机模式下使用，尊重游戏开发者的劳动成果。  
