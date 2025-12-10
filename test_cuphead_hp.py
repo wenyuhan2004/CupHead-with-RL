@@ -1,4 +1,6 @@
 import time
+import os
+import re
 import ctypes
 from ctypes import wintypes
 import win32gui, win32process, win32api
@@ -17,6 +19,47 @@ kernel32.ReadProcessMemory.argtypes = [
     ctypes.POINTER(ctypes.c_size_t)  # lpNumberOfBytesRead
 ]
 kernel32.ReadProcessMemory.restype = wintypes.BOOL
+
+# Tesseract 路径：优先环境变量 TESSERACT_CMD，其次默认安装路径
+DEFAULT_TESS = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESS_CMD = os.environ.get("TESSERACT_CMD", DEFAULT_TESS)
+
+# -------- OCR Boss HP (备用方案，无内存读权限时使用) --------
+def read_boss_hp_ocr(frame, roi, psm: int = 6):
+    """
+    使用 OCR 读取 Boss 血量，格式如 '123.4/1234'。
+    frame: BGR 图像
+    roi: (x,y,w,h)
+    """
+    try:
+        import cv2
+        import pytesseract
+    except Exception:
+        return None, None
+    if TESS_CMD and os.path.exists(TESS_CMD):
+        pytesseract.pytesseract.tesseract_cmd = TESS_CMD
+    x, y, w, h = roi
+    crop = frame[y:y + h, x:x + w]
+    if crop.size == 0:
+        return None, None
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cfg = f"--psm {psm} -c tessedit_char_whitelist=0123456789./"
+    try:
+        text = pytesseract.image_to_string(th, config=cfg).strip()
+    except Exception:
+        return None, None
+    text = re.sub(r"^[^\d]+", "", text)
+    m = re.search(r"(\d+(?:\.\d+)?)[^\d]+(\d+)", text)
+    if not m:
+        return None, None
+    cur = float(m.group(1))
+    mx = float(m.group(2))
+    if mx <= 0:
+        return None, None
+    cur = min(cur, mx)
+    return cur, mx
 
 def rpm(hproc, address, buf):
     """简单封装 ReadProcessMemory，不打印调试信息"""
@@ -140,8 +183,8 @@ def read_player_hp(hproc, mono_base):
     mono.dll + 0x002BD940 -> 0x688 -> 0xE8 -> 0x120 -> +0xB4 (int)
     对应 CE 图：15A63D1245C，值为 4。
     """
-    base_offset = 0x002BD940
-    deref_offsets = [0x688, 0xE8, 0x120]
+    base_offset = 0x002675D8
+    deref_offsets = [0xCA8, 0x20, 0x60,0x60]
     last_offset = 0xB4
 
     addr = mono_base + base_offset
@@ -167,24 +210,21 @@ def read_player_hp(hproc, mono_base):
 # -------- Player X (float) --------
 def read_player_x(hproc, unity_base):
 
-    base_addr = unity_base + 0x01468F30
+    base_addr = unity_base + 0x013B1330
 
     ptr = ctypes.c_uint64()
     if not rpm(hproc, base_addr, ptr):
         return None
 
     # ptr → 18167C1D300
-    ptr1_addr = ptr.value + 0x38
+    ptr1_addr = ptr.value + 0xA0
     if not rpm(hproc, ptr1_addr, ptr):
         return None
 
-    # ptr → 18195A540CD0
-    ptr2_addr = ptr.value + 0x140
-    if not rpm(hproc, ptr2_addr, ptr):
-        return None
+
 
     # ptr → 1895A5F91B0
-    final_addr = ptr.value + 0x688   # 最后一级不是 pointer!!
+    final_addr = ptr.value + 0x2D0   # 最后一级不是 pointer!!
 
     x_val = ctypes.c_float()
     if not rpm(hproc, final_addr, x_val):
@@ -268,14 +308,38 @@ def monitor_cuphead_hp(duration: float = 10.0, interval: float = 0.2):
 
 
 if __name__ == "__main__":
-    hproc, pid = open_cuphead()
-    mono_base  = enum_module(hproc, pid, "mono.dll")
-    unity_base = enum_module(hproc, pid, "UnityPlayer.dll")
-    print("mono base :", hex(mono_base))
-    print("unity base:", hex(unity_base))
+    import dxcam, cv2, time, json
 
-    stable_hp = None
-    candidate_hp = None
-    candidate_count = 0
+    cam = dxcam.create(output_color="BGR")
+    cam.start(target_fps=10, video_mode=True)
+    time.sleep(0.2)
 
-    monitor_cuphead_hp()
+    # 优先使用 roi_selected.json（calibrate_roi.py 生成）
+    roi_path = os.path.join(os.path.dirname(__file__), "roi_selected.json")
+    roi = None
+    if os.path.exists(roi_path):
+        try:
+            with open(roi_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 兼容两种字段：{"roi": [...]} 或 {"boss_hp_roi": [...]}
+            arr = data.get("roi") or data.get("boss_hp_roi")
+            roi = tuple(int(x) for x in arr) if arr else None
+        except Exception:
+            roi = None
+    if not roi or len(roi) != 4:
+        raise RuntimeError("缺少 ROI，请先用 calibrate_roi.py 生成 roi_selected.json 或在其中配置 boss_hp_roi")
+
+    try:
+        while True:
+            frame = cam.get_latest_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            cur, mx = read_boss_hp_ocr(frame, roi)
+            print(f"OCR Boss HP: {cur}/{mx}")
+            monitor_cuphead_hp()
+            time.sleep(0.2)
+    finally:
+        cam.stop()

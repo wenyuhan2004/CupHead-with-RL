@@ -19,6 +19,7 @@ try:
     from cuphead_dqn.test_cuphead_hp import (
         read_player_hp as test_read_player_hp,
         read_boss_hp as test_read_boss_hp,
+        read_boss_hp_ocr as test_read_boss_hp_ocr,
         read_player_x as test_read_player_x,
         read_skill_points as test_read_skill_points,
         open_cuphead as test_open_cuphead,
@@ -30,6 +31,7 @@ except Exception:
         from test_cuphead_hp import (  # type: ignore
             read_player_hp as test_read_player_hp,
             read_boss_hp as test_read_boss_hp,
+            read_boss_hp_ocr as test_read_boss_hp_ocr,
             read_player_x as test_read_player_x,
             read_skill_points as test_read_skill_points,
             open_cuphead as test_open_cuphead,
@@ -39,6 +41,7 @@ except Exception:
     except Exception:  # pragma: no cover - optional dependency
         test_read_player_hp = None
         test_read_boss_hp = None
+        test_read_boss_hp_ocr = None
         test_read_player_x = None
         test_open_cuphead = None
         test_enum_module = None
@@ -109,7 +112,7 @@ class CupheadEnv(gym.Env):
         reward_duck_dash: float = 0.01,
         # 新增奖励调参项：
         reward_boss_damage_mul: float = 0.1,
-        reward_progress_bonus: float = 0.004,
+        reward_progress_bonus: float = 1.0,  # 每秒生存奖励
         reward_player_damage_penalty: float = 10.0,
         reward_skill_use: float = 0.5,
         reward_shoot_hold: float = 0.0,
@@ -125,8 +128,8 @@ class CupheadEnv(gym.Env):
         hp_valid_age: float = 1.0,
         step_log_path=None,
         # 位置相关
-        x_min: float = -615.0,
-        x_max: float = 615.0,
+        x_min: float = -655.0,
+        x_max: float = 125.0,
         x_margin: float = 5.0,
         reward_wall_penalty: float = 5.0,
         dir_hold_limit: int = 20,
@@ -258,6 +261,10 @@ class CupheadEnv(gym.Env):
         self._skill_points = 0.0
         self._last_player_print = None
         self._dash_triggered = False
+        self._dash_cooldown = 0
+        self._boss_q_used = False
+        self._survival_block = 0
+        self._episode_start_ts = time.perf_counter()
         self._last_player_hp_raw = None
         self._step_log_fp = None
         self._step_log_writer = None
@@ -459,6 +466,9 @@ class CupheadEnv(gym.Env):
         if len(mask) < 10:
             mask = list(mask) + [0] * (10 - len(mask))
         L, R, Up, Down, Jump, Shoot, Dash, Lock, Special, JumpHold = [int(x) for x in mask]
+        # dash 冷却：若冷却中则屏蔽 dash 输入
+        if getattr(self, "_dash_cooldown", 0) > 0:
+            Dash = 0
         # 攻击键改为两步一按（1/0交替）
         if not hasattr(self, "_shoot_phase"):
             self._shoot_phase = False
@@ -524,13 +534,14 @@ class CupheadEnv(gym.Env):
         # --- 智能跳跃系统 ---
         if Jump and not self._prev_action[4]:
             # 根据JumpHold决定跳跃时长：短跳/长跳
-            jump_duration = 0.20 if JumpHold else 0.12
+            jump_duration = 0.10 if JumpHold else 0.06
             self._tap(self.key_jump, dur=jump_duration)
             Jump = 0
         if Dash and not self._prev_action[6]:
             self._tap(self.key_dash, dur=0.06)  # 适中 dash 按压
             self._recent_crouch_dash = bool(self._held.get(self.key_down, False))
             self._dash_triggered = True
+            self._dash_cooldown = 5  # 本步后禁用接下来5步的冲刺
             Dash = 0
 
         # --- 技能键 ---（禁用技能逻辑）
@@ -539,6 +550,9 @@ class CupheadEnv(gym.Env):
         self._prev_action = [L, R, Up, down_trigger, Jump, Shoot, Dash, Lock, Special, JumpHold]
         # 防卡键保险：本步无需的键立即抬起
         self._release_safety(L, R, Up, False, False, False, Lock, Shoot)
+        # 冷却递减
+        if getattr(self, "_dash_cooldown", 0) > 0:
+            self._dash_cooldown -= 1
 
     # ====== OCR读取 ====== #
     def _read_boss_hp(self, frame):
@@ -590,16 +604,26 @@ class CupheadEnv(gym.Env):
         return stable
 
     def _fetch_boss_hp(self, frame):
-        # 直接从内存读取，不使用缓存/线程
+        # 优先使用 OCR ROI 读取 Boss HP（暂不从内存读）
         boss_val = None
-        if self._hp_hproc and self._hp_mono_base and test_read_boss_hp:
+        boss_max = None
+        if test_read_boss_hp_ocr and self._roi_boss:
             try:
-                boss_val = test_read_boss_hp(self._hp_hproc, self._hp_mono_base)
+                boss_val = test_read_boss_hp_ocr(frame, self._roi_boss)
             except Exception:
                 boss_val = None
-        if boss_val is not None:
-            boss_m = max(boss_val, self.last_boss[1]) if self.last_boss[1] is not None else boss_val
-            return float(boss_val), float(boss_m)
+        # 兼容 OCR 返回 (cur, max) 或仅返回 cur
+        if isinstance(boss_val, (tuple, list)) and len(boss_val) >= 2:
+            cur_val = boss_val[0]
+            boss_max = boss_val[1]
+        else:
+            cur_val = boss_val
+        if cur_val is not None:
+            if boss_max is None:
+                boss_max = self.last_boss[1]
+                boss_max = max(cur_val, boss_max) if boss_max is not None else cur_val
+            return float(cur_val), float(boss_max)
+        # OCR 失败则沿用上一次值
         return self.last_boss
 
     def _fetch_player_hp(self, frame):
@@ -633,6 +657,20 @@ class CupheadEnv(gym.Env):
         time.sleep(0.3)
         self._skip_reset_once = False
         self._pending_reset = False
+        now_ts = time.perf_counter()
+
+        # 确保 OCR ROI 已加载
+        if not hasattr(self, "_roi_boss") or self._roi_boss is None:
+            roi_path = os.path.join(os.path.dirname(__file__), "roi_selected.json")
+            if os.path.exists(roi_path):
+                try:
+                    with open(roi_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    roi = data.get("roi") or data.get("boss_hp_roi")
+                    if roi and len(roi) == 4:
+                        self._roi_boss = tuple(int(x) for x in roi)
+                except Exception:
+                    self._roi_boss = None
 
         frame = self._get_latest_frame()
         g = self._obs_from_frame(frame)
@@ -651,16 +689,26 @@ class CupheadEnv(gym.Env):
         self.facing_dir = None
         self._recent_crouch_dash = False
         self._dash_triggered = False
+        self._dash_cooldown = 0
+        self._boss_q_used = False
+        self._survival_block = 0
+        self._episode_start_ts = now_ts
         self.last_player_hp = self.player_hp_max
         self._last_player_hp_raw = None
         self._pending_safe = []
         self._dir_hold_steps = 0
         self._dir_hold_dir = 0
+        self._progress_last_ts = time.perf_counter()
+        self._traverse_dir = None  # "L2R" or "R2L"
+        self._traverse_hp = None
+        self._traverse_progress = []
+        self._traverse_cooldown_ts = None
         focus_cuphead_window()  # 保持窗口前台，避免按键丢失
         return self.stackbuf.copy(), {}
 
     def step(self, action):
-        t0 = time.perf_counter()
+        # 使用单一高精度时间戳，供本步所有逻辑使用
+        now_ts = time.perf_counter()
         # 记录使用技能前的计数，以便在后续奖励中判断是否消耗技能点
         parry_used_before = self.parry_used
         self._apply_action(action, allow_k=True)
@@ -682,6 +730,13 @@ class CupheadEnv(gym.Env):
         boss_c = float(boss_c)
         boss_m = float(boss_m)
         # 持续打印 Boss HP
+        # Boss 血量低于阈值时只按一次 Q
+        if (not getattr(self, "_boss_q_used", False)) and boss_c < 450.0:
+            try:
+                pag.press("q")
+            except Exception:
+                pass
+            self._boss_q_used = True
 
         raw_hp = self._fetch_player_hp(frame)
         self._last_player_hp_raw = raw_hp
@@ -694,7 +749,6 @@ class CupheadEnv(gym.Env):
                 ply_hp = self.last_player_hp
             else:
                 ply_hp = raw_hp
-
 
         parry_cur = 0
 
@@ -725,8 +779,62 @@ class CupheadEnv(gym.Env):
         hp_term = 0.0
         if ply_hp is not None and self.last_player_hp is not None:
             hp_drop = max(0.0, self.last_player_hp - ply_hp)
-            hp_term = -11.0 * hp_drop
+            hp_term = -20.0 * hp_drop
+            if hp_drop > 0:
+                self._survival_block = 10
         reward = boss_term + hp_term
+
+        # 左右穿越奖励：中途里程碑 + 最终达成奖励，前提是不掉血
+        hp_now = ply_hp if ply_hp is not None else self.last_player_hp
+        if x_cur is not None and hp_now is not None:
+            # 冷却判断：完成一次穿梭后需等待 3s 才能重新开始
+            in_cooldown = False
+            if self._traverse_cooldown_ts is not None:
+                if (now_ts - self._traverse_cooldown_ts) < 3.0:
+                    in_cooldown = True
+                else:
+                    self._traverse_cooldown_ts = None
+
+            if self._traverse_dir is None and not in_cooldown:
+                if x_cur <= -500:
+                    self._traverse_dir = "L2R"
+                    self._traverse_hp = hp_now
+                    self._traverse_progress = [-400, -300, -200, -100]
+                elif x_cur >= 0:
+                    self._traverse_dir = "R2L"
+                    self._traverse_hp = hp_now
+                    self._traverse_progress = [-100, -200, -300, -400]
+            elif self._traverse_dir is not None:
+                if hp_now < (self._traverse_hp if self._traverse_hp is not None else hp_now):
+                    self._traverse_dir = None
+                    self._traverse_hp = None
+                    self._traverse_progress = []
+                else:
+                    # 经过里程碑奖励（每个 +5）
+                    keep_thresholds = []
+                    for th in self._traverse_progress:
+                        if self._traverse_dir == "L2R" and x_cur >= th:
+                            reward += 2.0
+                            continue
+                        if self._traverse_dir == "R2L" and x_cur <= th:
+                            reward += 2.0
+                            continue
+                        keep_thresholds.append(th)
+                    self._traverse_progress = keep_thresholds
+                    # 最终达成奖励（+10）
+                    completed = False
+                    if self._traverse_dir == "L2R" and x_cur >= 0:
+                        reward += 4.0
+                        completed = True
+                    elif self._traverse_dir == "R2L" and x_cur <= -500:
+                        reward += 4.0
+                        completed = True
+                    if completed:
+                        self._traverse_dir = None
+                        self._traverse_hp = None
+                        self._traverse_progress = []
+                        self._traverse_cooldown_ts = now_ts
+
         # 边界推进惩罚/奖励：在边缘向外走扣分，向内走奖励
         if x_cur is not None:
             at_left_edge = (x_cur <= self.x_min + self.x_margin)
@@ -734,27 +842,51 @@ class CupheadEnv(gym.Env):
             if at_left_edge:
                 if cur_left:
                     reward -= self.reward_wall_penalty
-                    print(0)
                 if cur_right:
                     reward += 2.0
-                    print(1)
             if at_right_edge:
                 if cur_right:
                     reward -= self.reward_wall_penalty
-                    print(0)
                 if cur_left:
                     reward += 2.0
-                    print(1)
+            # 超过 200 的区域，无论动作如何都扣分
+            if x_cur > 200:
+                reward -= self.reward_wall_penalty
+
         if ply_hp is not None:
             self.last_player_hp = ply_hp
 
-        # 提前结束以避免击杀后无法重开：Boss 血量低于 50 即视为胜利
-        win = (boss_c <= 50.0)
+        # 存活奖励：仅在本步动作包含移动/跳/冲刺时按时间累积（每秒 reward_progress_bonus）
+        if self._progress_last_ts is None:
+            self._progress_last_ts = now_ts
+        elapsed = max(0.0, now_ts - self._progress_last_ts)
+        act_mask_full = list(action) if isinstance(action, (list, tuple)) else np.array(action).tolist()
+        if len(act_mask_full) < 10:
+            act_mask_full = act_mask_full + [0] * (10 - len(act_mask_full))
+        move_flags = act_mask_full[0] or act_mask_full[1] or act_mask_full[2] or act_mask_full[3] or act_mask_full[4] or act_mask_full[6]
+        # 仅在横坐标处于 [-400, 400] 区间内才给予生存奖励，且需要有移动/跳/冲刺动作
+        x_for_reward = x_cur if x_cur is not None else self.x_last
+        in_center_band = (x_for_reward is not None) and (-400 <= x_for_reward <= 400)
+        if self._step_count >= self.warmup_steps and in_center_band and move_flags and self._survival_block <= 0:
+            # Boss 越残血，生存奖励越高：按血量进度线性放大 (1 + progress)
+            progress = 0.0
+            if boss_m > 0:
+                progress = max(0.0, min(1.0, (boss_m - boss_c) / boss_m))
+            # 存活时间越长，奖励越高：每 10 秒乘 1.2，封顶 10 倍
+            episode_time = max(0.0, now_ts - getattr(self, "_episode_start_ts", now_ts))
+            time_factor = min(10.0, 1.2 ** (episode_time / 10.0))
+            reward += elapsed * self.reward_progress_bonus * (1.0 + progress) * time_factor
+        self._progress_last_ts = now_ts
+        if self._survival_block > 0:
+            self._survival_block -= 1
+
+        # 提前结束以避免击杀后无法重开：Boss 血量 <=0 视为胜利
+        win = (boss_c <= 0.0)
         if ply_hp is None:
             ply_hp = self.last_player_hp
         dead = False
         if ply_hp is not None:
-            dead = (ply_hp <= 1)
+            dead = (ply_hp < 1)
         done = win or dead
         done_reason = "win" if win else ("dead" if dead else None)
 
@@ -788,20 +920,22 @@ class CupheadEnv(gym.Env):
             "dead": dead,
             "done_reason": done_reason,
         }
-        # 不写入步级 CSV 日志
+
         self._step_count += 1
+
         # 打印总 FPS（包含抓帧+推理周期），每 50 步统计一次
         self._fps_counter += 1
         if self._fps_counter >= 50:
-            now_ts = time.time()
-            elapsed = now_ts - self._fps_last_ts
-            if elapsed > 0:
-                fps = self._fps_counter / elapsed
+            now_wall = time.time()
+            elapsed_wall = now_wall - self._fps_last_ts
+            if elapsed_wall > 0:
+                fps = self._fps_counter / elapsed_wall
                 self._last_fps = fps
             self._fps_counter = 0
-            self._fps_last_ts = now_ts
+            self._fps_last_ts = now_wall
 
         return self.stackbuf.copy(), reward, done, False, info
+
 
     def render(self):
         pass
